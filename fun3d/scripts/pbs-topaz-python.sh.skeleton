@@ -1,0 +1,173 @@
+#!/bin/bash
+
+# Required Directives ======================================
+
+### Number of nodes and how many processors per node
+###   About 15k cells / core is good
+###   Gone as low as 2k cells / core on background hours
+###   Standard queue has 36 cores / node and 3456 nodes with 116 GB ram each
+###      Example: 3,600,000 nodes / (15,000 nodes/core ) / 36 (cores/node) ~ 7 nodes
+#PBS -l select={SH_NODES}:ncpus=36:mpiprocs=36
+
+### The longest time it can run - if the script runs less, doesn't count towards hours
+#PBS -l walltime={SH_HOURS}:{SH_MINUTES}:00
+
+### queue: standard_lg, standard_sm, standard_lw, debug, background
+###        should only have to use standard, debug, or backgorund (it auto picks the subtype)
+#PBS -q {SH_QUEUE}
+
+### Which subproject ID this will count against.
+#      The ones available are shown on login message and by running show_usage
+#PBS -A {SH_PBS_SUBPROJECT_ID} 
+
+# Optional Directives ======================================
+
+### Send email when job begins (b), ends (e), and aborts (a)
+#PBS -m a
+
+### Email address(s) to send to. Separate by commas
+#PBS -M {SH_EMAIL}
+
+# Output merged stdout and stderr (o: stdout and e: stderr)
+#PBS -o run.log
+
+### Job name
+#PBS -N {SH_JOBNAME}
+
+# NOTE
+# This script relies on externally defined variables
+# WORKDIR        : Scratch space
+# PROJECTS_HOME  : Where the modules, executables, and scripts are
+#
+# This script assumes you are running qsub command from within
+# the folder containing all of your run files!
+
+# Execution Block ===========================================
+# Rename for consistency
+SETUPDIR=${PBS_O_WORKDIR}
+
+# --------------------------------
+# Copy starting folder to run directory
+
+# Extract job id numbers
+JOBID=`echo ${PBS_JOBID} | cut -d '.' -f 1`
+
+# Where we want to copy the run folder to
+JOBDIR=${PBS_JOBNAME}.${JOBID}.TOPAZ
+
+# Make a folder next to the setup folder
+RUNDIR=${SETUPDIR}/../${JOBDIR}
+mkdir -p ${RUNDIR}
+
+# (Selectively) Copy from submit folder to run folder
+cp ${SETUPDIR}/{*lines*,fun3d.nml,*.sh,tdata,*.flow,*.ugrid,*.mapbc,*.partitioning} ${RUNDIR}/
+
+# Go into the run folder
+cd ${RUNDIR}
+
+# --------------------------------
+# Setup modules to run application (this is via a script)
+source $PROJECTS_HOME/AFITUS3D/share/scripts/loadFun3d.sh
+
+# --------------------------------
+# Store the name of the sorted unique (-u) PBS assigned hosts
+# (nodes) to the file hosts
+sort -u ${PBS_NODEFILE} > hosts
+
+# --------------------------------
+# Email self a better start and stop email
+#env | grep PBS
+#emailSubject="${PBS_JOBNAME}.${JOBID}"
+#$PBS_O_MAIL -s "$emailSubject" ${emailAddress} <<EOF
+#"Started!"
+#EOF
+#
+#return 0
+
+# --------------------------------
+# Start the run! 
+
+# Put time at start of run
+echo ========Run Start
+date
+
+# Record path and version of executable we're running
+which nodet_mpi
+nodet_mpi --version
+
+# Launching ======================================================
+# Run the actual parallel thing!
+OUTPUTFILE="sim.out"
+mpirun \
+  --np ${BC_MPI_TASKS_ALLOC} \
+  --hostfile hosts \
+  nodet_mpi \
+  >& ${OUTPUTFILE}
+
+# Record time at end of run
+date
+
+# Cleanup block  =====================================
+# grab last N lines of output file
+#NUMLINES=100
+#SIMULATION_OUTPUT=$(tail -n ${NUMLINES} ${OUTPUTFILE})
+#
+## Mail it home!
+#mail -s "$emailSubject" ${emailAddress} <<EOF
+#Finished!
+#
+#Last ${NUMLINES} of ${OUTPUTFILE}
+#==================================
+#
+#${SIMULATION_OUTPUT}
+#EOF
+
+# Create a cleanup script to archive the run
+cat >archive.${JOBID}.sh <<end
+#!/bin/bash
+#PBS -l walltime=024:00:00
+#PBS -q transfer
+#PBS -A {SH_PBS_SUBPROJECT_ID}
+#PBS -l select=1:ncpus=1
+#PBS -j oe
+#PBS -S /bin/bash
+#PBS -o archive.${JOBID}.out
+#PBS -W depend=afterok:${JOBID}
+#PBS -l application=tecplot
+
+# Go to run directory
+cd ${RUNDIR}
+
+# Run tecplot to convert ASCII (*.tec) files to binary
+module load tecplot
+for f in *.tec
+  do (
+    echo "Processing \$f"
+    preplot \$f
+  )
+done
+
+# Remove ASCII files
+rm *.tec
+
+# Copy PBS log and error files to the run directory
+cp --preserve ${SETUPDIR}/{*.log,*.err} ${RUNDIR}/
+
+# Copy old boundary/volume output files to the run directory, WITHOUT overwriting
+cp --preserve --no-clober ${SETUPDIR}/{*.plt} ${RUNDIR}/
+
+# Go one level above the run directory so we don't get crazy relative paths in tar file
+cd ${RUNDIR}/..
+
+# tar everything up
+tar -zcvf ${JOBDIR}.tar.gz ${JOBDIR}
+
+# Send the tar off to archive
+archive put -C ${ARCHIVE_HOME} -p ${JOBDIR}.tar.gz
+
+# Show a listing of the archive
+archive ls ${ARCHIVE_HOME}
+end
+
+# Submit cleanup script
+qsub archive.${JOBID}.sh
